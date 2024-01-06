@@ -2,11 +2,11 @@ private import cpp as Cpp
 private import DataFlowUtil
 private import semmle.code.cpp.ir.IR
 private import DataFlowDispatch
-private import DataFlowImplConsistency
 private import semmle.code.cpp.ir.internal.IRCppLanguage
 private import SsaInternals as Ssa
 private import DataFlowImplCommon as DataFlowImplCommon
 private import codeql.util.Unit
+private import Node0ToString
 
 cached
 private module Cached {
@@ -59,6 +59,41 @@ private module Cached {
 import Cached
 private import Nodes0
 
+/**
+ * A module for calculating the number of stars (i.e., `*`s) needed for various
+ * dataflow node `toString` predicates.
+ */
+module NodeStars {
+  private int getNumberOfIndirections(Node n) {
+    result = n.(RawIndirectOperand).getIndirectionIndex()
+    or
+    result = n.(RawIndirectInstruction).getIndirectionIndex()
+    or
+    result = n.(VariableNode).getIndirectionIndex()
+    or
+    result = n.(PostUpdateNodeImpl).getIndirectionIndex()
+    or
+    result = n.(FinalParameterNode).getIndirectionIndex()
+  }
+
+  private int maxNumberOfIndirections() { result = max(getNumberOfIndirections(_)) }
+
+  private string repeatStars(int n) {
+    n = 0 and result = ""
+    or
+    n = [1 .. maxNumberOfIndirections()] and
+    result = "*" + repeatStars(n - 1)
+  }
+
+  /**
+   * Gets the number of stars (i.e., `*`s) needed to produce the `toString`
+   * output for `n`.
+   */
+  string stars(Node n) { result = repeatStars(getNumberOfIndirections(n)) }
+}
+
+import NodeStars
+
 class Node0Impl extends TIRDataFlowNode0 {
   /**
    * INTERNAL: Do not use.
@@ -81,6 +116,14 @@ class Node0Impl extends TIRDataFlowNode0 {
 
   /** Gets the operands corresponding to this node, if any. */
   Operand asOperand() { result = this.(OperandNode0).getOperand() }
+
+  /** Gets the location of this node. */
+  final Location getLocation() { result = this.getLocationImpl() }
+
+  /** INTERNAL: Do not use. */
+  Location getLocationImpl() {
+    none() // overridden by subclasses
+  }
 
   /** INTERNAL: Do not use. */
   string toStringImpl() {
@@ -131,10 +174,12 @@ abstract class InstructionNode0 extends Node0Impl {
 
   override DataFlowType getType() { result = getInstructionType(instr, _) }
 
-  override string toStringImpl() {
-    // This predicate is overridden in subclasses. This default implementation
-    // does not use `Instruction.toString` because that's expensive to compute.
-    result = instr.getOpcode().toString()
+  override string toStringImpl() { result = instructionToString(instr) }
+
+  override Location getLocationImpl() {
+    if exists(instr.getAst().getLocation())
+    then result = instr.getAst().getLocation()
+    else result instanceof UnknownDefaultLocation
   }
 
   final override predicate isGLValue() { exists(getInstructionType(instr, true)) }
@@ -174,7 +219,13 @@ abstract class OperandNode0 extends Node0Impl {
 
   override DataFlowType getType() { result = getOperandType(op, _) }
 
-  override string toStringImpl() { result = op.toString() }
+  override string toStringImpl() { result = operandToString(op) }
+
+  override Location getLocationImpl() {
+    if exists(op.getDef().getAst().getLocation())
+    then result = op.getDef().getAst().getLocation()
+    else result instanceof UnknownDefaultLocation
+  }
 
   final override predicate isGLValue() { exists(getOperandType(op, true)) }
 }
@@ -220,9 +271,10 @@ private module IndirectOperands {
     int indirectionIndex;
 
     IndirectOperandFromIRRepr() {
-      exists(Operand repr |
-        repr = Ssa::getIRRepresentationOfIndirectOperand(operand, indirectionIndex) and
-        nodeHasOperand(this, repr, indirectionIndex - 1)
+      exists(Operand repr, int indirectionIndexRepr |
+        Ssa::hasIRRepresentationOfIndirectOperand(operand, indirectionIndex, repr,
+          indirectionIndexRepr) and
+        nodeHasOperand(this, repr, indirectionIndexRepr)
       )
     }
 
@@ -262,9 +314,10 @@ private module IndirectInstructions {
     int indirectionIndex;
 
     IndirectInstructionFromIRRepr() {
-      exists(Instruction repr |
-        repr = Ssa::getIRRepresentationOfIndirectInstruction(instr, indirectionIndex) and
-        nodeHasInstruction(this, repr, indirectionIndex - 1)
+      exists(Instruction repr, int indirectionIndexRepr |
+        Ssa::hasIRRepresentationOfIndirectInstruction(instr, indirectionIndex, repr,
+          indirectionIndexRepr) and
+        nodeHasInstruction(this, repr, indirectionIndexRepr)
       )
     }
 
@@ -554,7 +607,7 @@ predicate instructionForFullyConvertedCall(Instruction instr, CallInstruction ca
 }
 
 /** Holds if `node` represents the output node for `call`. */
-private predicate simpleOutNode(Node node, CallInstruction call) {
+predicate simpleOutNode(Node node, CallInstruction call) {
   operandForFullyConvertedCall(node.asOperand(), call)
   or
   instructionForFullyConvertedCall(node.asInstruction(), call)
@@ -621,6 +674,24 @@ class GlobalLikeVariable extends Variable {
 }
 
 /**
+ * Returns the smallest indirection for the type `t`.
+ *
+ * For most types this is `1`, but for `ArrayType`s (which are allocated on
+ * the stack) this is `0`
+ */
+int getMinIndirectionsForType(Type t) {
+  if t.getUnspecifiedType() instanceof Cpp::ArrayType then result = 0 else result = 1
+}
+
+private int getMinIndirectionForGlobalUse(Ssa::GlobalUse use) {
+  result = getMinIndirectionsForType(use.getUnspecifiedType())
+}
+
+private int getMinIndirectionForGlobalDef(Ssa::GlobalDef def) {
+  result = getMinIndirectionsForType(def.getUnspecifiedType())
+}
+
+/**
  * Holds if data can flow from `node1` to `node2` in a way that loses the
  * calling context. For example, this would happen with flow through a
  * global or static variable.
@@ -631,20 +702,20 @@ predicate jumpStep(Node n1, Node n2) {
       v = globalUse.getVariable() and
       n1.(FinalGlobalValue).getGlobalUse() = globalUse
     |
-      globalUse.getIndirectionIndex() = 1 and
+      globalUse.getIndirection() = getMinIndirectionForGlobalUse(globalUse) and
       v = n2.asVariable()
       or
-      v = n2.asIndirectVariable(globalUse.getIndirectionIndex())
+      v = n2.asIndirectVariable(globalUse.getIndirection())
     )
     or
     exists(Ssa::GlobalDef globalDef |
       v = globalDef.getVariable() and
       n2.(InitialGlobalValue).getGlobalDef() = globalDef
     |
-      globalDef.getIndirectionIndex() = 1 and
+      globalDef.getIndirection() = getMinIndirectionForGlobalDef(globalDef) and
       v = n1.asVariable()
       or
-      v = n1.asIndirectVariable(globalDef.getIndirectionIndex())
+      v = n1.asIndirectVariable(globalDef.getIndirection())
     )
   )
 }
@@ -681,9 +752,7 @@ predicate storeStepImpl(Node node1, Content c, PostFieldUpdateNode node2, boolea
  * Thus, `node2` references an object with a field `f` that contains the
  * value of `node1`.
  */
-predicate storeStep(Node node1, Content c, PostFieldUpdateNode node2) {
-  storeStepImpl(node1, c, node2, _)
-}
+predicate storeStep(Node node1, ContentSet c, Node node2) { storeStepImpl(node1, c, node2, _) }
 
 /**
  * Holds if `operandFrom` flows to `operandTo` using a sequence of conversion-like
@@ -692,7 +761,7 @@ predicate storeStep(Node node1, Content c, PostFieldUpdateNode node2) {
 private predicate numberOfLoadsFromOperandRec(
   Operand operandFrom, Operand operandTo, int ind, boolean certain
 ) {
-  exists(Instruction load | Ssa::isDereference(load, operandFrom) |
+  exists(Instruction load | Ssa::isDereference(load, operandFrom, _) |
     operandTo = operandFrom and ind = 0 and certain = true
     or
     numberOfLoadsFromOperand(load.getAUse(), operandTo, ind - 1, certain)
@@ -716,7 +785,7 @@ private predicate numberOfLoadsFromOperand(
 ) {
   numberOfLoadsFromOperandRec(operandFrom, operandTo, n, certain)
   or
-  not Ssa::isDereference(_, operandFrom) and
+  not Ssa::isDereference(_, operandFrom, _) and
   not conversionFlow(operandFrom, _, _, _) and
   operandFrom = operandTo and
   n = 0 and
@@ -744,7 +813,7 @@ predicate nodeHasInstruction(Node node, Instruction instr, int indirectionIndex)
  * Thus, `node1` references an object with a field `f` whose value ends up in
  * `node2`.
  */
-predicate readStep(Node node1, Content c, Node node2) {
+predicate readStep(Node node1, ContentSet c, Node node2) {
   exists(FieldAddress fa1, Operand operand, int numberOfLoads, int indirectionIndex2 |
     nodeHasOperand(node2, operand, indirectionIndex2) and
     // The `1` here matches the `node2.getIndirectionIndex() = 1` conjunct
@@ -767,7 +836,7 @@ predicate readStep(Node node1, Content c, Node node2) {
 /**
  * Holds if values stored inside content `c` are cleared at node `n`.
  */
-predicate clearsContent(Node n, Content c) {
+predicate clearsContent(Node n, ContentSet c) {
   n =
     any(PostUpdateNode pun, Content d | d.impliesClearOf(c) and storeStepImpl(_, d, pun, true) | pun)
         .getPreUpdateNode() and
@@ -792,7 +861,7 @@ predicate clearsContent(Node n, Content c) {
       storeStepImpl(_, d, pun, true) and
       pun.getPreUpdateNode() = n
     |
-      c.getIndirectionIndex() = d.getIndirectionIndex()
+      c.(Content).getIndirectionIndex() = d.getIndirectionIndex()
     )
   )
 }
@@ -804,6 +873,8 @@ predicate clearsContent(Node n, Content c) {
 predicate expectsContent(Node n, ContentSet c) { none() }
 
 predicate typeStrongerThan(DataFlowType t1, DataFlowType t2) { none() }
+
+predicate localMustFlowStep(Node node1, Node node2) { none() }
 
 /** Gets the type of `n` used for type pruning. */
 DataFlowType getNodeType(Node n) {
@@ -834,12 +905,6 @@ class CastNode extends Node {
 }
 
 /**
- * Holds if `n` should never be skipped over in the `PathGraph` and in path
- * explanations.
- */
-predicate neverSkipInPathGraph(Node n) { none() }
-
-/**
  * A function that may contain code or a variable that may contain itself. When
  * flow crosses from one _enclosing callable_ to another, the interprocedural
  * data-flow library discards call contexts and inserts a node in the big-step
@@ -853,7 +918,7 @@ class DataFlowType = Type;
 
 /** A function call relevant for data flow. */
 class DataFlowCall extends CallInstruction {
-  Function getEnclosingCallable() { result = this.getEnclosingFunction() }
+  DataFlowCallable getEnclosingCallable() { result = this.getEnclosingFunction() }
 }
 
 module IsUnreachableInCall {
@@ -923,8 +988,6 @@ module IsUnreachableInCall {
 }
 
 import IsUnreachableInCall
-
-int accessPathLimit() { result = 5 }
 
 /**
  * Holds if access paths with `c` at their head always should be tracked at high
@@ -1021,14 +1084,6 @@ ContentApprox getContentApprox(Content c) {
   )
 }
 
-private class MyConsistencyConfiguration extends Consistency::ConsistencyConfiguration {
-  override predicate argHasPostUpdateExclude(ArgumentNode n) {
-    // The rules for whether an IR argument gets a post-update node are too
-    // complex to model here.
-    any()
-  }
-}
-
 /**
  * A local flow relation that includes both local steps, read steps and
  * argument-to-return flow through summarized functions.
@@ -1088,7 +1143,7 @@ private IRVariable getIRVariableForParameterNode(ParameterNode p) {
 
 /** Holds if `v` is the source variable corresponding to the parameter represented by `p`. */
 pragma[nomagic]
-private predicate parameterNodeHasSourceVariable(ParameterNode p, Ssa::SourceIRVariable v) {
+private predicate parameterNodeHasSourceVariable(ParameterNode p, Ssa::SourceVariable v) {
   v.getIRVariable() = getIRVariableForParameterNode(p) and
   exists(Position pos | p.isParameterOf(_, pos) |
     pos instanceof DirectPosition and
@@ -1121,4 +1176,56 @@ private int countNumberOfBranchesUsingParameter(SwitchInstruction switch, Parame
         strictcount(phi.getAnInput())
       )
   )
+}
+
+/**
+ * Holds if the data-flow step from `node1` to `node2` can be used to
+ * determine where side-effects may return from a callable.
+ * For C/C++, this means that the step from `node1` to `node2` not only
+ * preserves the value, but also preserves the identity of the value.
+ * For example, the assignment to `x` that reads the value of `*p` in
+ * ```cpp
+ * int* p = ...
+ * int x = *p;
+ * ```
+ * does not preserve the identity of `*p`.
+ */
+bindingset[node1, node2]
+pragma[inline_late]
+predicate validParameterAliasStep(Node node1, Node node2) {
+  // When flow-through summaries are computed we track which parameters flow to out-going parameters.
+  // In an example such as:
+  // ```
+  // modify(int* px) { *px = source(); }
+  // void modify_copy(int* p) {
+  //   int x = *p;
+  //   modify(&x);
+  // }
+  // ```
+  // since dataflow tracks each indirection as a separate SSA variable dataflow
+  // sees the above roughly as
+  // ```
+  // modify(int* px, int deref_px) { deref_px = source(); }
+  // void modify_copy(int* p, int deref_p) {
+  //   int x = deref_p;
+  //   modify(&x, x);
+  // }
+  // ```
+  // and when dataflow computes flow from a parameter to a post-update node to
+  // conclude which parameters are "updated" by the call to `modify_copy` it
+  // finds flow from `x [post update]` to `deref_p [post update]`.
+  // To prevent this we exclude steps that don't preserve identity. We do this
+  // by excluding flow from the right-hand side of `StoreInstruction`s to the
+  // `StoreInstruction`. This is sufficient because, for flow-through summaries,
+  // we're only interested in indirect parameters such as `deref_p` in the
+  // exampe above (i.e., the parameters with a non-zero indirection index), and
+  // if that ever flows to the right-hand side of a `StoreInstruction` then
+  // there must have been a dereference to reduce its indirection index down to
+  // 0.
+  not exists(Operand operand |
+    node1.asOperand() = operand and
+    node2.asInstruction().(StoreInstruction).getSourceValueOperand() = operand
+  )
+  // TODO: Also block flow through models that don't preserve identity such
+  // as `strdup`.
 }

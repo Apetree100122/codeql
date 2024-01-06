@@ -9,7 +9,7 @@ private import semmle.code.csharp.frameworks.system.Web
 private import semmle.code.csharp.frameworks.system.web.Mvc
 private import semmle.code.csharp.security.Sanitizers
 private import semmle.code.csharp.frameworks.microsoft.AspNetCore
-private import semmle.code.csharp.dataflow.ExternalFlow
+private import semmle.code.csharp.dataflow.internal.ExternalFlow
 
 /**
  * A data flow source for unvalidated URL redirect vulnerabilities.
@@ -27,13 +27,6 @@ abstract class Sink extends DataFlow::ExprNode { }
 abstract class Sanitizer extends DataFlow::ExprNode { }
 
 /**
- * DEPRECATED: Use `Sanitizer` instead.
- *
- * A guard for unvalidated URL redirect vulnerabilities.
- */
-abstract deprecated class SanitizerGuard extends DataFlow::BarrierGuard { }
-
-/**
  * DEPRECATED: Use `UrlRedirect` instead.
  *
  * A taint-tracking configuration for reasoning about unvalidated URL redirect vulnerabilities.
@@ -46,10 +39,6 @@ deprecated class TaintTrackingConfiguration extends TaintTracking::Configuration
   override predicate isSink(DataFlow::Node sink) { sink instanceof Sink }
 
   override predicate isSanitizer(DataFlow::Node node) { node instanceof Sanitizer }
-
-  deprecated override predicate isSanitizerGuard(DataFlow::BarrierGuard guard) {
-    guard instanceof SanitizerGuard
-  }
 }
 
 /**
@@ -126,14 +115,24 @@ class HttpServerTransferSink extends Sink {
   }
 }
 
-private predicate isLocalUrlSanitizer(Guard g, Expr e, AbstractValue v) {
-  g.(MethodCall).getTarget().hasName("IsLocalUrl") and
-  e = g.(MethodCall).getArgument(0) and
+private predicate isLocalUrlSanitizerMethodCall(MethodCall guard, Expr e, AbstractValue v) {
+  exists(Method m | m = guard.getTarget() |
+    m.hasName("IsLocalUrl") and
+    e = guard.getArgument(0)
+    or
+    m.hasName("IsUrlLocalToHost") and
+    e = guard.getArgument(1)
+  ) and
   v.(AbstractValues::BooleanValue).getValue() = true
 }
 
+private predicate isLocalUrlSanitizer(Guard g, Expr e, AbstractValue v) {
+  isLocalUrlSanitizerMethodCall(g, e, v)
+}
+
 /**
- * A URL argument to a call to `UrlHelper.isLocalUrl()` that is a sanitizer for URL redirects.
+ * A URL argument to a call to `UrlHelper.IsLocalUrl()` or `HttpRequestBase.IsUrlLocalToHost()` that
+ * is a sanitizer for URL redirects.
  */
 class LocalUrlSanitizer extends Sanitizer {
   LocalUrlSanitizer() { this = DataFlow::BarrierGuard<isLocalUrlSanitizer/3>::getABarrierNode() }

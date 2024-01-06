@@ -383,6 +383,11 @@ export class TypeTable {
    */
   public restrictedExpansion = false;
 
+  /**
+   * If set to true, skip extracting types.
+   */
+  public skipExtractingTypes = false;
+
   private virtualSourceRoot: VirtualSourceRoot;
 
   /**
@@ -659,11 +664,16 @@ export class TypeTable {
    */
   public getSymbolId(symbol: AugmentedSymbol): number {
     if (symbol.flags & ts.SymbolFlags.Alias) {
-      symbol = this.typeChecker.getAliasedSymbol(symbol);
+      let aliasedSymbol: AugmentedSymbol = this.typeChecker.getAliasedSymbol(symbol);
+      if (aliasedSymbol.$id !== -1) { // Check if aliased symbol is on-stack
+        // Follow aliases eagerly, except in cases where this leads to cycles (for things like `import Foo = Foo.Bar`)
+        symbol = aliasedSymbol;
+      }
     }
     // We cache the symbol ID to avoid rebuilding long symbol strings.
     let id = symbol.$id;
     if (id != null) return id;
+    symbol.$id = -1; // Mark as on-stack while we are computing the ID
     let content = this.getSymbolString(symbol);
     id = this.symbolIds.get(content);
     if (id != null) {
@@ -1235,8 +1245,15 @@ export class TypeTable {
       let indexOnStack = stack.length;
       stack.push(id);
 
+      /** Indicates if a type contains no type variables, is a type variable, or strictly contains type variables. */
+      const enum TypeVarDepth {
+        noTypeVar = 0,
+        isTypeVar = 1,
+        containsTypeVar = 2,
+      }
+
       for (let symbol of type.getProperties()) {
-        let propertyType = this.tryGetTypeOfSymbol(symbol);
+        let propertyType = typeTable.tryGetTypeOfSymbol(symbol);
         if (propertyType == null) continue;
         traverseType(propertyType);
       }
@@ -1261,13 +1278,6 @@ export class TypeTable {
       }
 
       return lowlinkTable.get(id);
-
-      /** Indicates if a type contains no type variables, is a type variable, or strictly contains type variables. */
-      const enum TypeVarDepth {
-        noTypeVar = 0,
-        isTypeVar = 1,
-        containsTypeVar = 2,
-      }
 
       function traverseType(type: ts.Type): TypeVarDepth {
         if (isTypeVariable(type)) return TypeVarDepth.isTypeVar;

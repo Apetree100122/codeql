@@ -5,7 +5,6 @@ private import codeql.swift.controlflow.ControlFlowGraph
 private import codeql.swift.controlflow.CfgNodes
 private import codeql.swift.controlflow.internal.Scope
 private import FlowSummaryImpl as FlowSummaryImpl
-private import FlowSummaryImplSpecific as FlowSummaryImplSpecific
 private import codeql.swift.dataflow.FlowSummary as FlowSummary
 
 newtype TReturnKind =
@@ -354,14 +353,4 @@ predicate parameterMatch(ParameterPosition ppos, ArgumentPosition apos) {
   apos instanceof TThisArgument
   or
   ppos.(PositionalParameterPosition).getIndex() = apos.(PositionalArgumentPosition).getIndex()
-}
-
-/**
- * Holds if flow from `call`'s argument `arg` to parameter `p` is permissible.
- *
- * This is a temporary hook to support technical debt in the Go language; do not use.
- */
-pragma[inline]
-predicate golangSpecificParamArgFilter(DataFlowCall call, ParameterNode p, ArgumentNode arg) {
-  any()
 }

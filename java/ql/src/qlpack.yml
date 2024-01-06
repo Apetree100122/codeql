@@ -1,6 +1,6 @@
 name: codeql/java-queries
-version: 0.7.2-dev
-groups: 
+version: 0.8.6-dev
+groups:
   - java
   - queries
 suites: codeql-suites

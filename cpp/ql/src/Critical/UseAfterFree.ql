@@ -2,7 +2,7 @@
  * @name Potential use after free
  * @description An allocated memory block is used after it has been freed. Behavior in such cases is undefined and can cause memory corruption.
  * @kind path-problem
- * @precision medium
+ * @precision high
  * @id cpp/use-after-free
  * @problem.severity warning
  * @security-severity 9.3
@@ -29,9 +29,8 @@ private predicate externalCallNeverDereferences(FormattingFunctionCall call, int
   )
 }
 
-predicate isUse0(DataFlow::Node n, Expr e) {
-  e = n.asExpr() and
-  not isFree(_, e, _) and
+predicate isUse0(Expr e) {
+  not isFree(_, _, e, _) and
   (
     e = any(PointerDereferenceExpr pde).getOperand()
     or
@@ -43,7 +42,7 @@ predicate isUse0(DataFlow::Node n, Expr e) {
     or
     // Assume any function without a body will dereference the pointer
     exists(int i, Call call, Function f |
-      n.asExpr() = call.getArgument(i) and
+      e = call.getArgument(i) and
       f = call.getTarget() and
       not f.hasEntryPoint() and
       // Exclude known functions we know won't dereference the pointer.
@@ -57,7 +56,7 @@ module ParameterSinks {
   import semmle.code.cpp.ir.ValueNumbering
 
   predicate flowsToUse(DataFlow::Node n) {
-    isUse0(n, _)
+    isUse0(n.asExpr())
     or
     exists(DataFlow::Node succ |
       flowsToUse(succ) and
@@ -90,7 +89,7 @@ module ParameterSinks {
   ) {
     pragma[only_bind_out](source.asParameter()) = pragma[only_bind_out](init.getParameter()) and
     paramToUse(source, sink) and
-    isUse0(sink, _)
+    isUse0(sink.asExpr())
   }
 
   private InitializeParameterInstruction getAnAlwaysDereferencedParameter0() {
@@ -102,35 +101,43 @@ module ParameterSinks {
     )
   }
 
-  private CallInstruction getAnAlwaysReachedCallInstruction(IRFunction f) {
-    result.getBlock().postDominates(f.getEntryBlock())
+  private CallInstruction getAnAlwaysReachedCallInstruction() {
+    exists(IRFunction f | result.getBlock().postDominates(f.getEntryBlock()))
   }
 
   pragma[nomagic]
-  predicate callHasTargetAndArgument(Function f, int i, CallInstruction call, Instruction argument) {
-    call.getStaticCallTarget() = f and
-    call.getArgument(i) = argument
+  private predicate callHasTargetAndArgument(Function f, int i, Instruction argument) {
+    exists(CallInstruction call |
+      call.getStaticCallTarget() = f and
+      call.getArgument(i) = argument and
+      call = getAnAlwaysReachedCallInstruction()
+    )
   }
 
   pragma[nomagic]
-  predicate initializeParameterInFunction(Function f, int i, InitializeParameterInstruction init) {
-    pragma[only_bind_out](init.getEnclosingFunction()) = f and
-    init.hasIndex(i)
+  private predicate initializeParameterInFunction(Function f, int i) {
+    exists(InitializeParameterInstruction init |
+      pragma[only_bind_out](init.getEnclosingFunction()) = f and
+      init.hasIndex(i) and
+      init = getAnAlwaysDereferencedParameter()
+    )
+  }
+
+  pragma[nomagic]
+  private predicate alwaysDereferencedArgumentHasValueNumber(ValueNumber vn) {
+    exists(int i, Function f, Instruction argument |
+      callHasTargetAndArgument(f, i, argument) and
+      initializeParameterInFunction(pragma[only_bind_into](f), pragma[only_bind_into](i)) and
+      vn.getAnInstruction() = argument
+    )
   }
 
   InitializeParameterInstruction getAnAlwaysDereferencedParameter() {
     result = getAnAlwaysDereferencedParameter0()
     or
-    exists(
-      CallInstruction call, int i, InitializeParameterInstruction p, Instruction argument,
-      Function f
-    |
-      callHasTargetAndArgument(f, i, call, argument) and
-      initializeParameterInFunction(f, i, p) and
-      p = getAnAlwaysDereferencedParameter() and
-      result =
-        pragma[only_bind_out](pragma[only_bind_into](valueNumber(argument)).getAnInstruction()) and
-      call = getAnAlwaysReachedCallInstruction(_)
+    exists(ValueNumber vn |
+      alwaysDereferencedArgumentHasValueNumber(vn) and
+      vn.getAnInstruction() = result
     )
   }
 }
@@ -139,7 +146,7 @@ module IsUse {
   private import semmle.code.cpp.ir.dataflow.internal.DataFlowImplCommon
 
   predicate isUse(DataFlow::Node n, Expr e) {
-    isUse0(n, e)
+    isUse0(e) and n.asExpr() = e
     or
     exists(CallInstruction call, InitializeParameterInstruction init |
       n.asOperand().getDef().getUnconvertedResultExpression() = e and
@@ -171,6 +178,6 @@ module UseAfterFree = FlowFromFree<isUse/2, isExcludeFreeUsePair/2>;
 from UseAfterFree::PathNode source, UseAfterFree::PathNode sink, DeallocationExpr dealloc
 where
   UseAfterFree::flowPath(source, sink) and
-  isFree(source.getNode(), _, dealloc)
+  isFree(source.getNode(), _, _, dealloc)
 select sink.getNode(), source, sink, "Memory may have been previously freed by $@.", dealloc,
   dealloc.toString()

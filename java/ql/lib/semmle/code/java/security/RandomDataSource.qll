@@ -7,7 +7,7 @@ import java
 /**
  * A method access that returns random data or writes random data to an argument.
  */
-abstract class RandomDataSource extends MethodAccess {
+abstract class RandomDataSource extends MethodCall {
   /**
    * Gets the integer lower bound, inclusive, of the values returned by this call,
    * if applicable to this method's type and a constant bound is known.
@@ -103,8 +103,17 @@ class StdlibRandomSource extends RandomDataSource {
   }
 
   override Expr getOutput() {
-    if m.hasName("getBytes") then result = this.getArgument(0) else result = this
+    if m.hasName("nextBytes") then result = this.getArgument(0) else result = this
   }
+}
+
+/**
+ * A method access calling the `random` of `java.lang.Math`.
+ */
+class MathRandomSource extends RandomDataSource {
+  MathRandomSource() { this.getMethod().hasQualifiedName("java.lang", "Math", "random") }
+
+  override Expr getOutput() { result = this }
 }
 
 /**
@@ -139,6 +148,22 @@ class ApacheCommonsRandomSource extends RandomDataSource {
     or
     m.hasName(["nextInt", "nextLong"]) and
     m.getNumberOfParameters() = 2
+  }
+
+  override Expr getOutput() { result = this }
+}
+
+/**
+ * A method access calling a method declared on `org.apache.commons.lang3.RandomStringUtils`
+ */
+class ApacheCommonsRandomStringSource extends RandomDataSource {
+  ApacheCommonsRandomStringSource() {
+    exists(Method m | m = this.getMethod() |
+      m.getName().matches("random%") and
+      m.getDeclaringType()
+          .hasQualifiedName(["org.apache.commons.lang3", "org.apache.commons.lang"],
+            "RandomStringUtils")
+    )
   }
 
   override Expr getOutput() { result = this }
